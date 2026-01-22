@@ -3,12 +3,15 @@ import requests
 import subprocess
 
 from airflow import DAG
-from datetime import datetime, timedelta
 from airflow.operators.python import PythonOperator
 from airflow.providers.ssh.operators.ssh import SSHOperator
+
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.hooks.base import BaseHook
+
 from kafka import KafkaConsumer
+from clickhouse_driver import Client
+from datetime import datetime, timedelta
 
 KAFKA_BROKER = '172.17.0.13:9092'
 PATH_TO_KAFKA = '/opt/airflow/dags/27_svistunov/data_generators/producer_to_kafka_svistunov.py'
@@ -41,7 +44,7 @@ def send_telegram_alert(message, **context):
 
 
 def pipeline_success_alert(**context):
-    """Алерт об успешном завершении всего пайплайна"""
+    """Уведомление об успешном завершении всего пайплайна"""
 
     dag_id = context['dag'].dag_id
     execution_date = context['execution_date']
@@ -50,11 +53,12 @@ def pipeline_success_alert(**context):
                f"DAG: {dag_id}\n"
                f"Время: {execution_date}\n"
                f"Статус: Все этапы выполнены\n"
-               f"Генерация данных → Kafka\n"
-               f"Обработка Spark → HDFS\n"
-               f"Загрузка в Greenplum\n"
-               f"Создание ODS/DDS таблиц\n"
-               f"Создание DM")
+               f"1. Генерация данных → Kafka\n"
+               f"2. Обработка Spark → HDFS\n"
+               f"3. Загрузка в Greenplum\n"
+               f"4. Создание ODS и DDS\n"
+               f"5. Создание DM\n"
+               f"6. Миграция в Clickhouse")
 
     send_telegram_alert(message, **context)
 
@@ -109,6 +113,36 @@ def check_greenplum(**context):
     raise Exception("Не удалось подключиться к Greenplum после 3 попыток")
 
 
+def check_clickhouse(**context):
+    """Проверка подключения к ClickHouse"""
+
+    ti = context['task_instance']
+
+    for attempt in range(3):
+        try:
+
+            connection = BaseHook.get_connection("svistunov_clickhouse")
+
+            client = Client(
+                host=connection.host,
+                port=connection.port,
+                database=connection.schema
+            )
+            client.execute('SELECT 1')
+            client.disconnect()
+
+            ti.log.info("ClickHouse успешное подключение")
+            return
+
+        except Exception as e:
+            ti.log.warning(f"Clickhouse ошибка соединения: {attempt + 1}/3 failed: {e}")
+
+            if attempt < 2:
+                time.sleep(30)
+
+    raise Exception("Не удалось подключиться к Clickhouse после 3 попыток")
+
+
 def send_to_kafka(**context):
     """Запуск скрипта генерации и загрузки в кафку"""
 
@@ -146,6 +180,43 @@ def _execute_sql_script(sql_file, **context):
     task_instance.log.info(f"SQL script {sql_file} completed successfully")
 
 
+def migrate_dm_to_clickhouse(**context):
+    """Миграция dm данных из Greenplum в ClickHouse"""
+
+    gp_hook = PostgresHook(postgres_conn_id='svistunov_gp')
+    data = gp_hook.get_pandas_df('SELECT * FROM svistunov_dm.fraud_dashboard')
+
+    connection = BaseHook.get_connection("svistunov_clickhouse")
+    ch_client = Client(
+        host=connection.host,
+        port=connection.port,
+        database=connection.schema
+    )
+
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS fraud_dashboard (
+        client_id Int32,
+        first_name String,
+        last_name String,
+        total_transactions Int32,
+        avg_transaction_amount Decimal(15,2),
+        max_transaction_amount Decimal(15,2),
+        suspicious_transaction_count Int32,
+        login_count Int32,
+        financial_risk UInt8,
+        activity_risk UInt8,
+        risk_score Int32
+    ) ENGINE = MergeTree()
+    ORDER BY client_id
+    """
+    ch_client.execute(create_table_sql)
+
+    if not data.empty:
+        ch_client.execute('INSERT INTO fraud_dashboard VALUES', data.to_dict('records'))
+
+    ch_client.disconnect()
+
+
 default_args = {
     'owner': 'a.svistunov',
     'retries': 1,
@@ -162,6 +233,7 @@ with DAG(
         catchup=False,
 ) as dag:
 
+####################################################################################################
     check_kafka = PythonOperator(
         task_id='check_kafka_availability',
         python_callable=check_kafka,
@@ -177,6 +249,12 @@ with DAG(
         task_id='check_greenplum_connection',
         python_callable=check_greenplum,
     )
+
+    check_clickhouse = PythonOperator(
+        task_id='check_clickhouse_connection',
+        python_callable=check_clickhouse,
+    )
+
 ####################################################################################################
     send_data_to_kafka = PythonOperator(
         task_id='send_data_to_kafka',
@@ -230,6 +308,12 @@ with DAG(
         python_callable=_execute_sql_script,
         op_kwargs={'sql_file': 'create_and_load_to_dm.sql'}
     )
+
+    migrate_data = PythonOperator(
+        task_id='migrate_dm_to_clickhouse',
+        python_callable=migrate_dm_to_clickhouse,
+    )
+
 ####################################################################################################
     # Финальное пуш-уведомление в тг
     pipeline_success = PythonOperator(
@@ -237,9 +321,9 @@ with DAG(
         python_callable=pipeline_success_alert,
     )
 ####################################################################################################
-    [check_kafka, check_ssh, check_greenplum] >> send_data_to_kafka >> from_kafka_to_hdfs
+    [check_kafka, check_ssh, check_greenplum, check_clickhouse] >> send_data_to_kafka >> from_kafka_to_hdfs
 
     from_kafka_to_hdfs >> [create_external_tables, create_ods_tables, create_dds_tables]
 
     [create_external_tables, create_ods_tables, create_dds_tables] >> load_ods_data >> load_dds_data
-    load_dds_data >> create_and_load_to_dm >> pipeline_success
+    load_dds_data >> create_and_load_to_dm >> migrate_data >> pipeline_success
