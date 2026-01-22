@@ -1,5 +1,5 @@
 My test ETL pipeline for financial fraud detection.
-Using Kafka, Spark, Greenplum and Airflow.
+Using Kafka, Spark, Greenplum, ClickHouse and Airflow.
 
 End-to-end data pipeline:
-Data → Kafka → Spark → HDFS → Greenplum
+Data → Kafka → Spark → HDFS → Greenplum → ClickHouse
